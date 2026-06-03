@@ -1,0 +1,61 @@
+{
+  "rules": [
+    {
+      "id": "temp_high",
+      "data_type": "temperature",
+      "condition": "value > threshold",
+      "threshold": 60,
+      "action": "alert",
+      "severity": 2,
+      "need_task": true,
+      "trigger_mode": "immediate",
+      "task": { "type": "alert", "priority": "high" }
+    },
+    {
+      "id": "eeg_arousal_peak",
+      "data_type": "eeg",
+      "condition": "arousal > 0.8 && arousal_duration_ms > 3000",
+      "action": "analyze",
+      "severity": 1,
+      "need_task": true,
+      "trigger_mode": "immediate",
+      "task": { "type": "correlation_analysis", "priority": "high" }
+    },
+    {
+      "id": "legal_case_ingest",
+      "data_type": "legal_case",
+      "condition": "quality_score >= 0.7 && dedup_score < 0.9",
+      "action": "ingest_rag",
+      "severity": 0,
+      "need_task": true,
+      "trigger_mode": "on_transfer_done",
+      "task": {
+        "type": "rag_write",
+        "priority": "normal",
+        "params": { "target_kb": "case_library", "embedding_model": "bge-m3", "chunk_strategy": "legal_clause" }
+      }
+    },
+    {
+      "id": "legal_case_reject",
+      "data_type": "legal_case",
+      "condition": "quality_score < 0.7 || dedup_score >= 0.9",
+      "action": "reject",
+      "severity": 0,
+      "need_task": false
+    },
+    {
+      "id": "statute_ingest",
+      "data_type": "statute",
+      "condition": "quality_score >= 0.7",
+      "action": "ingest_rag",
+      "severity": 0,
+      "need_task": true,
+      "trigger_mode": "on_transfer_done",
+      "task": {
+        "type": "rag_write",
+        "priority": "normal",
+        "params": { "target_kb": "statute_library", "embedding_model": "bge-m3", "chunk_strategy": "by_article" }
+      }
+    }
+  ]
+}
