@@ -46,10 +46,12 @@ CREATE TABLE IF NOT EXISTS %[1]s (
     chunk_idx   INT  NOT NULL,
     text        TEXT NOT NULL,
     embedding   vector(%[2]d) NOT NULL,
+    tsv         tsvector GENERATED ALWAYS AS (to_tsvector('simple', text)) STORED,
     meta        JSONB NOT NULL DEFAULT '{}',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS %[1]s_ann   ON %[1]s USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS %[1]s_tsv   ON %[1]s USING gin (tsv);
 CREATE INDEX IF NOT EXISTS %[1]s_scope ON %[1]s (kb, tenant_id, data_type);
 CREATE INDEX IF NOT EXISTS %[1]s_src   ON %[1]s (kb, tenant_id, source_uri);`, table, dim)
 }
@@ -107,8 +109,68 @@ func (s *PGStore) Search(ctx context.Context, kb string, queryVec []float32, k i
 	if k <= 0 {
 		k = 8
 	}
-	args := []interface{}{vecLiteral(queryVec), kb}
-	where := []string{"kb = $2"}
+	// $1 is the query vector; scopeWhere appends kb + filter from $2 on.
+	args := []interface{}{vecLiteral(queryVec)}
+	args, where := scopeWhere(args, kb, f)
+	args = append(args, k)
+	q := fmt.Sprintf(`SELECT id, kb, tenant_id, source_uri, data_type, chunk_idx, text, meta,
+	                         1 - (embedding <=> $1::vector) AS score
+	                  FROM %s WHERE %s
+	                  ORDER BY embedding <=> $1::vector
+	                  LIMIT $%d`, s.table(), strings.Join(where, " AND "), len(args))
+	rows, err := s.DB.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanResults(rows)
+}
+
+// SearchKeyword is the sparse leg of hybrid retrieval: it scores chunks by
+// how many of the exact keywords they contain (text ILIKE), under the same
+// kb + filter isolation as Search. Chinese tokenizes poorly under PG's
+// default FTS parser, so the keyword match is exact-substring on the
+// caller-extracted high-signal tokens rather than tsvector BM25 (the tsv
+// column is provisioned for a future zhparser/BM25 leg). Generalized from
+// polar-lawyer's caseStore.searchKeyword.
+func (s *PGStore) SearchKeyword(ctx context.Context, kb string, keywords []string, k int, f Filter) ([]Result, error) {
+	if len(keywords) == 0 {
+		return nil, nil
+	}
+	if k <= 0 {
+		k = 8
+	}
+	args, where := scopeWhere(nil, kb, f)
+	var orParts, scoreParts []string
+	for _, kw := range keywords {
+		args = append(args, "%"+kw+"%")
+		p := fmt.Sprintf("text ILIKE $%d", len(args))
+		orParts = append(orParts, p)
+		scoreParts = append(scoreParts, "(CASE WHEN "+p+" THEN 1 ELSE 0 END)")
+	}
+	where = append(where, "("+strings.Join(orParts, " OR ")+")")
+	args = append(args, k)
+	q := fmt.Sprintf(`SELECT id, kb, tenant_id, source_uri, data_type, chunk_idx, text, meta,
+	                         (%s)::float AS score
+	                  FROM %s WHERE %s
+	                  ORDER BY score DESC, id
+	                  LIMIT $%d`, strings.Join(scoreParts, " + "), s.table(),
+		strings.Join(where, " AND "), len(args))
+	rows, err := s.DB.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanResults(rows)
+}
+
+// scopeWhere appends the kb + Filter predicates to args (using positional
+// placeholders from the current arg count + 1) and returns the grown args
+// plus the WHERE conditions. Shared by Search and SearchKeyword so both
+// legs enforce identical tenant/data_type/status/meta isolation in SQL.
+func scopeWhere(args []interface{}, kb string, f Filter) ([]interface{}, []string) {
+	args = append(args, kb)
+	where := []string{fmt.Sprintf("kb = $%d", len(args))}
 	add := func(cond string, v interface{}) {
 		args = append(args, v)
 		where = append(where, fmt.Sprintf(cond, len(args)))
@@ -127,17 +189,12 @@ func (s *PGStore) Search(ctx context.Context, kb string, queryVec []float32, k i
 		args = append(args, val)
 		where = append(where, fmt.Sprintf("meta->>'%s' = $%d", sanitizeKey(key), len(args)))
 	}
-	args = append(args, k)
-	q := fmt.Sprintf(`SELECT id, kb, tenant_id, source_uri, data_type, chunk_idx, text, meta,
-	                         1 - (embedding <=> $1::vector) AS score
-	                  FROM %s WHERE %s
-	                  ORDER BY embedding <=> $1::vector
-	                  LIMIT $%d`, s.table(), strings.Join(where, " AND "), len(args))
-	rows, err := s.DB.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	return args, where
+}
+
+// scanResults reads the common Result column set (Search + SearchKeyword
+// select identical columns + a trailing score).
+func scanResults(rows *sql.Rows) ([]Result, error) {
 	var out []Result
 	for rows.Next() {
 		var r Result
