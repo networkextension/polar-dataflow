@@ -52,6 +52,11 @@ type Store interface {
 	Upsert(ctx context.Context, chunks []Chunk, vectors [][]float32) error
 	// Search returns the top-k nearest chunks for queryVec under filter.
 	Search(ctx context.Context, kb string, queryVec []float32, k int, f Filter) ([]Result, error)
+	// SearchKeyword ranks chunks by how many of the exact keywords they
+	// contain (the sparse leg of hybrid retrieval). Same kb + filter
+	// isolation as Search. Empty keywords returns no rows. Keyword
+	// EXTRACTION is the caller's job (domain-specific) — see Hybrid.
+	SearchKeyword(ctx context.Context, kb string, keywords []string, k int, f Filter) ([]Result, error)
 	// DeleteSource removes every chunk of a source (e.g. statute repealed,
 	// document withdrawn).
 	DeleteSource(ctx context.Context, kb, tenantID, sourceURI string) error
